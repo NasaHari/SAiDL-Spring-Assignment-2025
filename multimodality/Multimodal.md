@@ -479,5 +479,203 @@ Removing ses of different location    unique heads are
 ![](Aspose.Words.86820712-9c54-4cb4-8259-bfd256390db7.006.png)
 
 Graph  of nodes 211000:211100![](Aspose.Words.86820712-9c54-4cb4-8259-bfd256390db7.007.png)
+# CLIP-Based Embedding Extraction Pipeline
+
+In this pipeline, I use the `open_clip` library to extract embeddings from triples in a knowledge graph-style dataset.  
+Each triple is in the form: **(head, relation, tail)**, where the `tail` can be standard text, a geometry in WKT format, or even a base64-encoded image.  
+The embeddings are later useful for downstream tasks like link prediction, clustering, or visualization.
+
+---
+
+## 1. Imports and Setup
+
+Here, I import the necessary libraries for model loading, text/image preprocessing, memory management, and data handling.
+
+```python
+import torch
+import open_clip
+from shapely.wkt import loads as load_wkt
+from PIL import Image
+import io
+import base64
+import numpy as np
+import os
+import psutil
+import gc
+import random
+from tqdm import tqdm
+```
+
+---
+
+## 2. Model Initialization
+
+I load the CLIP model (`ViT-B-32`) with OpenAI's weights using `open_clip`, along with its preprocessing pipeline and tokenizer.
+
+```python
+model, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
+tokenizer = open_clip.get_tokenizer("ViT-B-32")
+
+# I use GPU if available, otherwise fallback to CPU.
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = model.to(device)
+```
+
+---
+
+## 3. Embedding Extraction Function
+
+This function processes a given triple and extracts a CLIP embedding.  
+I handle different cases for the `tail` (text, WKT geometry, base64 image) and encode the right input accordingly.
+
+```python
+def get_clip_embedding(triple, dataset, model, tokenizer, preprocess, device):
+    head, relation, tail = triple
+
+    # Convert from index to human-readable text
+    head_text = dataset.i2e[head][0]
+    relation_text = dataset.i2r[relation][0]
+    tail_text = dataset.i2e[tail][0]
+
+    if isinstance(tail_text, str):
+        # If it's a URL, label it
+        if tail_text.startswith("http") or tail_text.startswith("www"):
+            tail_text = f"URL: {tail_text}"
+
+        # If it's WKT geometry, parse and convert
+        elif tail_text.startswith("POLYGON") or tail_text.startswith("POINT"):
+            geom = load_wkt(tail_text)
+            tail_text = f"Geometry: {geom.wkt}"
+
+        # If it's an image encoded in base64 (custom prefix)
+        elif tail_text.startswith("jqwbwihbafohusbfnq"):
+            try:
+                image_bytes = base64.b64decode(tail_text)
+                image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                image_tensor = preprocess(image).unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    embedding = model.encode_image(image_tensor).cpu().numpy()
+                return embedding
+            except Exception as e:
+                print(f"Error processing image: {e}")
+                return np.zeros((1, 512))
+
+        # For generic text input, I form a single input string
+        text_input = f"Entity: {head_text}, Relation: {relation_text}, Value: {tail_text}"
+        tokenized = tokenizer([text_input]).to(device)
+
+        with torch.no_grad():
+            embedding = model.encode_text(tokenized).cpu().numpy()
+
+    else:
+        # If tail is not string-like, fallback to a dummy vector
+        embedding = np.zeros((1, 512))
+
+    return embedding
+```
+
+---
+
+## 4. Memory Monitoring
+
+To avoid running out of RAM (especially with large datasets), I check memory usage periodically.
+
+```python
+def check_memory_limit(threshold=80):
+    """Stop processing if RAM usage exceeds threshold (%)"""
+    mem = psutil.virtual_memory()
+    ram_used = mem.percent
+    if ram_used > threshold:
+        print(f"High RAM usage: {ram_used}%. Stopping execution.")
+        return True
+    return False
+```
+
+---
+
+## 5. Triple Inspection (For Debugging)
+
+Sometimes I manually inspect triples to understand unexpected output.
+
+```python
+triple = dataset.triples[4552]
+head_idx, relation_idx, tail_idx = triple.tolist()
+
+print(f"Head: {dataset.i2e[head_idx]}")
+print(f"Relation: {dataset.i2r[relation_idx]}")
+print(f"Tail: {dataset.i2e[tail_idx]}")
+```
+
+---
+
+## 6. Batch Embedding Pipeline
+
+This section is the heart of the pipeline. I process a subset of all triples in batches, extract their embeddings, and periodically save checkpoints.
+
+```python
+# Configuration
+batch_size = 512
+sampling_percentage = 0.2
+checkpoint_file = "clip_embeddings.npy"
+
+# I sample a subset of triples to speed up processing
+num_triples = len(dataset.triples)
+num_samples = int(num_triples * sampling_percentage)
+sampled_triples = random.sample(dataset.triples.tolist(), num_samples)
+
+print(f"Selected {num_samples}/{num_triples} triples for processing.")
+embedding_list = []
+save_every = 10000
+
+# If I previously saved a checkpoint, I load it to resume
+if os.path.exists(checkpoint_file):
+    print("Resuming from checkpoint...")
+    embedding_list = np.load(checkpoint_file, allow_pickle=True).tolist()
+
+start_index = len(embedding_list)
+print(f"Starting from triple {start_index}/{num_samples}")
+```
+
+### Main Processing Loop
+
+```python
+for i in tqdm(range(start_index, num_samples, batch_size), desc="Processing triples"):
+    batch = sampled_triples[i: i + batch_size]
+    batch_embeddings = []
+
+    for triple in batch:
+        embedding = get_clip_embedding(triple, dataset, model, tokenizer, preprocess, device)
+        batch_embeddings.append(embedding)
+
+        # Stop early if memory is too high
+        if check_memory_limit(threshold=85):
+            print("Stopping early to prevent crash.")
+            break
+
+    embedding_list.extend(batch_embeddings)
+
+    # Save progress at regular intervals or if memory is high
+    if (i + batch_size) % save_every == 0 or check_memory_limit(threshold=85):
+        np.save(checkpoint_file, np.array(embedding_list))
+        print(f"Checkpoint saved at {i + batch_size} triples.")
+        gc.collect()
+```
+
+### Final Save
+
+```python
+# I save the final embeddings to disk
+np.save(checkpoint_file, np.array(embedding_list))
+print(f"Embedding generation complete. Saved to {checkpoint_file}")
+```
+
+---
+
+## Summary
+
+In this pipeline, I systematically processed a structured dataset containing rich multi-modal information — including text, geometry, and images — using CLIP embeddings.  
+but had to stop for some reason too much time was taking even with GPU .
+
 
 
